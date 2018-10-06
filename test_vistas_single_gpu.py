@@ -49,7 +49,6 @@ def flip(x, dim):
 class SegmentationModule(nn.Module):
     _IGNORE_INDEX = 255
     
-
     class _MeanFusion:
         def __init__(self, x, classes):
             self.buffer = x.new_zeros(x.size(0), classes, x.size(2), x.size(3))
@@ -102,7 +101,8 @@ class SegmentationModule(nn.Module):
         super(SegmentationModule, self).__init__()
         self.body = body
         self.head = head
-        self.cls = nn.Conv2d(head_channels, classes, 1)
+        #self.cls = nn.Conv2d(head_channels, classes, 1)
+        self.cls = nn.Conv2d(head_channels, classes, 3) #3x3 conv layer 
 
         self.classes = classes
         if fusion_mode == "mean":
@@ -121,6 +121,8 @@ class SegmentationModule(nn.Module):
 
         x_up = self.body(x_up)
         x_up = self.head(x_up)
+
+        #pdb.set_trace()
 
         sem_logits = self.cls(x_up)
 
@@ -154,7 +156,7 @@ def main():
 
     # Torch stuff
     #torch.cuda.set_device(args.rank)
-    torch.cuda.set_device(1) # To get this to run on free RAAMAC GPU - Dominic
+    torch.cuda.set_device(0) # To get this to run on free RAAMAC GPU - Dominic
     cudnn.benchmark = True
 
     # Create model by loading a snapshot
@@ -177,7 +179,7 @@ def main():
     dataset = SegmentationDataset(args.data, transformation)
     data_loader = DataLoader(
         dataset,
-        batch_size=1,
+        batch_size=2,
         pin_memory=True,
         sampler=DistributedSampler(dataset, num_replicas=1,rank=args.rank),#args.world_size, args.rank),
         num_workers=1,
@@ -185,18 +187,25 @@ def main():
         shuffle=False
     )
 
-    training_dataset = TrainingSegmentationDataset('/media/storage2/dominic/semantic_reg/mapillarycode/RGBrunway',
+    training_dataset = TrainingSegmentationDataset('../RGBrunway',
                                                    transformation,
-                                                   '/media/storage2/dominic/semantic_reg/mapillarycode/traininglabels')
+                                                   '../traininglabels')
     data_train_loader = DataLoader(
         training_dataset,
         batch_size=2,
         pin_memory=True,
-        num_workers=1,
+        num_workers=0,
         collate_fn=segmentation_collate,
-        shuffle=True,#False
+        shuffle=True,
     )
 
+
+    ####################
+    #   TRAIN
+    ####################
+
+    
+    
     # Run fine-tuning (of modified class layers)   
     for p in model.body.parameters():
         p.requires_grad = False
@@ -205,31 +214,56 @@ def main():
     for q in model.cls.parameters():
         q.requires_grad = True
     
-    no_epochs = 50
-    LR = 1e-4
+    #no_epochs = 50
+    LR = 1e-5
     momentum = 0.98
-    epochs = 500
+    epochs = 200
+
+    
+    data = torch.load('ckpoint_399_SGDwithLRdecay_1e-05.pt')
+    tmpdict = {'weight' : data['cls.weight'], 
+               'bias': data['cls.bias']}
+    model.cls.load_state_dict(tmpdict)
+
 
     model.cuda().train()
+
+
+    #pdb.set_trace()
+
+    # Am definitely training on the right parameters.
 
     #optimizer = optim.SGD(filter(lambda x: x.requires_grad, model.parameters()),
     #                    lr=LR,momentum = momentum) 
 
     optimizer = optim.Adam(filter(lambda x: x.requires_grad, model.parameters()),
                         lr=LR)   
+    #n
+
     oname = 'Adam'
     
-    device = torch.device("cuda:1")
+    device = torch.device("cuda:0")
     scales = eval(args.scales)
     lossfunction = nn.CrossEntropyLoss().cuda()
+    #pdb.set_trace()
+
+    logforloss = open('lossfunction.txt','a')
 
     for epoch in range(epochs):
+
+        #if epoch == 200:
+        #    LR *= 0.1
+
+        if epoch == 100:
+            LR *= 0.1
 
         for batch_i, rec in enumerate(data_train_loader):
             
             img, target = rec["img"].to(device), rec["target"].to(device)
     
+            # Below line and all usage of 'img_name' is legacy code
             img_name = rec["meta"][0]["idx"]
+
             optimizer.zero_grad()
             #pdb.set_trace()
             
@@ -241,15 +275,34 @@ def main():
 
             #torch.save(model.state_dict,'ckpoint_{}_{}.pt'.format(batch_i,epoch))
             del preds, target, img,probs
-            print('Train Epoch: {} [/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+            logstring =  'Train Epoch: {} [/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
                     0 , len(data_train_loader.dataset),
-                    100. * batch_i / len(data_train_loader), loss.item())) 
-
-    torch.save(model.state_dict,'ckpoint_{}_{}_{}.pt'.format(epoch, 'Adam',LR))
-        
+                    100. * batch_i / len(data_train_loader), loss.item())
+            print(logstring)
+            logforloss.write(logstring + '\n') 
+    pdb.set_trace()
+    torch.save(model.state_dict(),'ckpoint_{}_{}_{}.pt'.format(epoch, 'SGDwithLRdecay+400',LR))
+    logforloss.close()
     
     
+    #################
+    #   TEST
+    #################
+    '''
+    # Load checkpoint
+    data = torch.load('ckpoint_399_AdamwithLRdecay_1e-05.pt')
+    
+    tmpdict = {'weight' : data['cls.weight'], 
+               'bias': data['cls.bias']}
+    model.cls.load_state_dict(tmpdict)
 
+    #pdb.set_trace()
+
+    #model.cls.load_state_dict(data["state_dict"]["cls"])
+    #modle.cls.weight = data([''])
+
+    model.cuda().eval()
+    
     # Run testing
     scales = eval(args.scales)
     with torch.no_grad(): # eval script
@@ -269,6 +322,7 @@ def main():
                 # Save prediction
                 prob = prob.cpu()
                 pred = pred.cpu()
+                #pdb.set_trace()
                 pred_img = get_pred_image(pred, out_size, args.output_mode == "palette")
                 pred_img.save(path.join(args.output, img_name + ".png"))
 
@@ -276,7 +330,7 @@ def main():
                 if args.output_mode == "prob":
                     prob_img = get_prob_image(prob, out_size)
                     prob_img.save(path.join(args.output, img_name + "_prob.png"))
-
+    '''
 
 def load_snapshot(snapshot_file):
     """Load a training snapshot"""
@@ -304,7 +358,7 @@ label_names = ["Bird", "Ground Animal", "Curb", "Fence", "Guard Rail", "Barrier"
                "Mailbox", "Manhole", "Phone Booth", "Pothole", "Street Light", "Pole", "Traffic Sign Frame", 
                "Utility Pole", "Traffic Light", "Traffic Sign (Back)", "Traffic Sign (Front)", "Trash Can", 
                "Bicycle", "Boat", "Bus", "Car", "Caravan", "Motorcycle", "On Rails", "Other Vehicle",
-               "Trailer", "Truck", "Wheeled Slow", "Car Mount", "Ego Vehicle"]#, "Unlabeled"]
+               "Trailer", "Truck", "Wheeled Slow", "Car Mount", "Ego Vehicle"]
 
 
 _PALETTE = np.array([[165, 42, 42],
@@ -396,7 +450,6 @@ def get_pred_image(tensor, out_size, with_palette):
     tensor = tensor.numpy()
     if with_palette:
         img = Image.fromarray(tensor.astype(np.uint8), mode="P")
-        #pdb.set_trace()
         img.putpalette(_PALETTE)
         
     else:
